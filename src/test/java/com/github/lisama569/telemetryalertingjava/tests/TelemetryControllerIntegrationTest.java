@@ -114,6 +114,50 @@ class TelemetryControllerIntegrationTest {
         log.info("HTTP 评估未知指标被拒: {}", evalUnknown);
     }
 
+    @Test
+    void backfillLookbackAndCapacityOverHttp() throws Exception {
+        // 批量补报：2 条正常（显式历史时间戳，仍在保留期内）+ 1 条未来时间戳被拒
+        long now = System.currentTimeMillis();
+        String receipt = mockMvc.perform(post("/telemetry/events/backfill")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"events\":["
+                                + "{\"api\":\"bf-api\",\"status\":\"SUCCESS\",\"latencyMillis\":10,"
+                                + "\"timestampMillis\":" + (now - 5_000L) + "},"
+                                + "{\"api\":\"bf-api\",\"status\":\"FAILURE\",\"latencyMillis\":20,"
+                                + "\"timestampMillis\":" + (now - 4_000L) + "},"
+                                + "{\"api\":\"bf-api\",\"status\":\"SUCCESS\",\"latencyMillis\":30,"
+                                + "\"timestampMillis\":" + (now + 60_000L) + "}]}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.acceptedCount").value(2))
+                .andExpect(jsonPath("$.rejectedCount").value(1))
+                .andExpect(jsonPath("$.rejections[0].reason").value("TIMESTAMP_IN_FUTURE"))
+                .andReturn().getResponse().getContentAsString();
+        log.info("HTTP 补报回执: {}", receipt);
+
+        // 按时刻回看：t=now-4.5s 的窗口只含第一条
+        String at = mockMvc.perform(get("/telemetry/metrics/bf-api")
+                        .param("at", String.valueOf(now - 4_500L)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.callCount").value(1))
+                .andExpect(jsonPath("$.successCount").value(1))
+                .andReturn().getResponse().getContentAsString();
+        log.info("HTTP 回看 t=now-4.5s: {}", at);
+
+        // 设置容量上限为 1：最旧的被淘汰，淘汰量可查询
+        mockMvc.perform(org.springframework.test.web.servlet.request.MockMvcRequestBuilders
+                        .put("/telemetry/metrics/bf-api/capacity")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"maxEvents\":1}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.evictedByCapacity").value(1));
+        String cap = mockMvc.perform(get("/telemetry/metrics/bf-api/capacity"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.retainedEvents").value(1))
+                .andExpect(jsonPath("$.evictedByCapacity").value(1))
+                .andReturn().getResponse().getContentAsString();
+        log.info("HTTP 容量状况: {}", cap);
+    }
+
     private void postEvent(String api, String status, long latency) throws Exception {
         mockMvc.perform(post("/telemetry/events")
                 .contentType(MediaType.APPLICATION_JSON)

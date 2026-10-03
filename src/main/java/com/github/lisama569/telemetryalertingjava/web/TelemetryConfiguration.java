@@ -23,8 +23,11 @@ public class TelemetryConfiguration {
     public MetricsRegistry metricsRegistry(
             Clock clock,
             @Value("${telemetry.window-millis:60000}") long windowMillis,
-            @Value("${telemetry.bucket-millis:1000}") long bucketMillis) {
-        return new MetricsRegistry(windowMillis, bucketMillis, clock);
+            @Value("${telemetry.bucket-millis:1000}") long bucketMillis,
+            @Value("${telemetry.retention-millis:60000}") long retentionMillis,
+            @Value("${telemetry.max-events-per-api:0}") long maxEventsPerApi) {
+        return new MetricsRegistry(windowMillis, bucketMillis, retentionMillis,
+                maxEventsPerApi, clock);
     }
 
     @Bean
