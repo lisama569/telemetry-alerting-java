@@ -5,7 +5,10 @@ import com.github.lisama569.telemetryalertingjava.alert.AlertEvaluator;
 import com.github.lisama569.telemetryalertingjava.alert.AlertRule;
 import com.github.lisama569.telemetryalertingjava.alert.ComparisonOperator;
 import com.github.lisama569.telemetryalertingjava.alert.InvalidAlertRuleException;
+import com.github.lisama569.telemetryalertingjava.metrics.BackfillReport;
+import com.github.lisama569.telemetryalertingjava.metrics.CallEvent;
 import com.github.lisama569.telemetryalertingjava.metrics.CallStatus;
+import com.github.lisama569.telemetryalertingjava.metrics.EvictionStats;
 import com.github.lisama569.telemetryalertingjava.metrics.InvalidMetricException;
 import com.github.lisama569.telemetryalertingjava.metrics.MetricType;
 import com.github.lisama569.telemetryalertingjava.metrics.MetricsRegistry;
@@ -18,8 +21,12 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -57,6 +64,71 @@ public class TelemetryController {
         return registry.snapshot(api)
                 .map(ResponseEntity::ok)
                 .orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND).build());
+    }
+
+    /**
+     * 历史补报：批量写入乱序、时间戳早于已见数据的埋点。
+     * 单条非法不拖垮整批，全部结果（接受落点 + 拒绝明细）体现在回执里。
+     */
+    @PostMapping("/events/backfill")
+    public BackfillReport backfill(@RequestBody BackfillRequest request) {
+        List<BackfillRequest.BackfillEvent> raw = request == null ? null : request.events();
+        if (raw == null) {
+            throw new InvalidMetricException(MetricsRegistry.REASON_NULL_EVENT,
+                    "events must not be null");
+        }
+        // 逐条解析：非法条目转为回执拒绝项（保留原始下标），合法条目交给核心层批量写入
+        List<CallEvent> parsed = new ArrayList<>();
+        List<Integer> parsedIndex = new ArrayList<>();
+        List<BackfillReport.Rejection> parseRejections = new ArrayList<>();
+        for (int i = 0; i < raw.size(); i++) {
+            BackfillRequest.BackfillEvent e = raw.get(i);
+            if (e == null) {
+                parseRejections.add(new BackfillReport.Rejection(
+                        i, null, MetricsRegistry.REASON_NULL_EVENT, "call event must not be null"));
+                continue;
+            }
+            try {
+                if (e.timestampMillis() == null) {
+                    throw new InvalidMetricException(MetricsRegistry.REASON_NULL_TIMESTAMP,
+                            "timestampMillis is required for backfill events");
+                }
+                if (e.latencyMillis() == null) {
+                    throw new InvalidMetricException(MetricsRegistry.REASON_NEGATIVE_LATENCY,
+                            "latencyMillis is required");
+                }
+                parsed.add(CallEvent.of(e.api(), parseStatus(e.status()),
+                        e.latencyMillis(), e.timestampMillis()));
+                parsedIndex.add(i);
+            } catch (InvalidMetricException ex) {
+                parseRejections.add(new BackfillReport.Rejection(
+                        i, e.api(), ex.reason(), ex.getMessage()));
+            }
+        }
+        BackfillReport core = registry.backfill(parsed);
+        // 核心层回执的下标是解析后列表的下标，映射回原始批次下标后与解析期拒绝项合并
+        List<BackfillReport.Rejection> rejections = new ArrayList<>(parseRejections);
+        for (BackfillReport.Rejection r : core.rejections()) {
+            rejections.add(new BackfillReport.Rejection(
+                    parsedIndex.get(r.index()), r.api(), r.reason(), r.message()));
+        }
+        rejections.sort(Comparator.comparingInt(BackfillReport.Rejection::index));
+        return new BackfillReport(raw.size(), core.accepted(), core.slots(), rejections);
+    }
+
+    /** 按时间点回看：查询历史时刻所在窗口的聚合，结果不受之后新写入影响。 */
+    @GetMapping("/metrics/{api}/at")
+    public ResponseEntity<WindowSnapshot> snapshotAt(@PathVariable String api,
+                                                     @RequestParam long timestampMillis) {
+        return registry.snapshotAt(api, timestampMillis)
+                .map(ResponseEntity::ok)
+                .orElseGet(() -> ResponseEntity.status(HttpStatus.NOT_FOUND).build());
+    }
+
+    /** 查询接口的容量淘汰统计（因容量上限被淘汰的量，单独暴露）。 */
+    @GetMapping("/metrics/{api}/evictions")
+    public EvictionStats evictions(@PathVariable String api) {
+        return registry.evictionStats(api);
     }
 
     /** 注册告警规则。 */
