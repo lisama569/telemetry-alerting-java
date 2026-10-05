@@ -15,10 +15,12 @@ import com.github.lisama569.telemetryalertingjava.metrics.MetricsRegistry;
 import com.github.lisama569.telemetryalertingjava.metrics.WindowSnapshot;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -129,6 +131,45 @@ public class TelemetryController {
     @GetMapping("/metrics/{api}/evictions")
     public EvictionStats evictions(@PathVariable String api) {
         return registry.evictionStats(api);
+    }
+
+    /** 查询接口当前生效的保留上限（运行期覆盖值或默认值）及默认值。 */
+    @GetMapping("/metrics/{api}/max-samples")
+    public Map<String, Object> getMaxSamples(@PathVariable String api) {
+        return Map.of(
+                "api", api,
+                "maxSamplesPerApi", registry.maxSamplesPerApi(api),
+                "defaultMaxSamplesPerApi", registry.maxSamplesPerApi(),
+                "overridden", registry.hasMaxSamplesOverride(api));
+    }
+
+    /** 运行期设置单接口保留上限，立即生效；上限必须为正数，否则 400 拒绝且不改动现状。 */
+    @PutMapping("/metrics/{api}/max-samples")
+    public Map<String, Object> setMaxSamples(@PathVariable String api,
+                                             @RequestBody MaxSamplesRequest request) {
+        Long maxSamples = request == null ? null : request.maxSamples();
+        if (maxSamples == null) {
+            throw new InvalidMetricException(MetricsRegistry.REASON_INVALID_MAX_SAMPLES,
+                    "maxSamples is required and must be positive");
+        }
+        registry.setMaxSamplesPerApi(api, maxSamples);
+        return Map.of(
+                "api", api,
+                "maxSamplesPerApi", registry.maxSamplesPerApi(api),
+                "defaultMaxSamplesPerApi", registry.maxSamplesPerApi(),
+                "overridden", true);
+    }
+
+    /** 清除接口的运行期上限覆盖，恢复默认上限，立即生效。 */
+    @DeleteMapping("/metrics/{api}/max-samples")
+    public Map<String, Object> clearMaxSamples(@PathVariable String api) {
+        boolean removed = registry.clearMaxSamplesPerApi(api);
+        return Map.of(
+                "api", api,
+                "removed", removed,
+                "maxSamplesPerApi", registry.maxSamplesPerApi(api),
+                "defaultMaxSamplesPerApi", registry.maxSamplesPerApi(),
+                "overridden", false);
     }
 
     /** 注册告警规则。 */

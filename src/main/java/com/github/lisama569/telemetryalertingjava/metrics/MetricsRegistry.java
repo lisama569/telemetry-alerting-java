@@ -20,8 +20,11 @@ import java.util.TreeMap;
  *       计数只有单一数据源，无论是窗口滚动淘汰还是容量淘汰，任何时刻读到的计数都不会为负；</li>
  *   <li>每个接口有独立锁（{@link ApiWindow} 内置），不同接口之间互不阻塞；
  *       补报按事件逐条短临界区写入，不会长时间卡住同一接口的实时写入；</li>
- *   <li>每接口可设保留样本上限 {@code maxSamplesPerApi}（0 = 不限），超限后按
- *       "最旧样本优先"的固定规则淘汰，被淘汰的量通过 {@link #evictionStats(String)} 单独暴露。</li>
+ *   <li>保留样本上限：构造参数 {@code maxSamplesPerApi} 为全接口默认值（0 = 不限），
+ *       运行期可用 {@link #setMaxSamplesPerApi(String, long)} 为单个接口覆盖、
+ *       {@link #maxSamplesPerApi(String)} 查询生效值、{@link #clearMaxSamplesPerApi(String)}
+ *       恢复默认，均立即生效无需重启；超限后按"最旧样本优先"的固定规则淘汰，
+ *       被淘汰的量通过 {@link #evictionStats(String)} 按接口单独暴露。</li>
  * </ul>
  */
 public class MetricsRegistry {
@@ -36,6 +39,8 @@ public class MetricsRegistry {
     public static final String REASON_NULL_EVENT = "NULL_EVENT";
     /** 补报事件缺少时间戳（历史数据必须携带事件时间）。 */
     public static final String REASON_NULL_TIMESTAMP = "NULL_TIMESTAMP";
+    /** 运行期设置的保留上限无效（<= 0；恢复默认请用 clearMaxSamplesPerApi）。 */
+    public static final String REASON_INVALID_MAX_SAMPLES = "INVALID_MAX_SAMPLES";
 
     private static final long DEFAULT_WINDOW_MILLIS = 60_000L;
     private static final long DEFAULT_BUCKET_MILLIS = 1_000L;
@@ -45,8 +50,11 @@ public class MetricsRegistry {
     private final long windowMillis;
     private final long bucketMillis;
     private final Clock clock;
-    /** 每接口保留样本数上限，0 表示不限（默认，兼容既有行为）。 */
+    /** 每接口保留样本数默认上限，0 表示不限（默认，兼容既有行为）。 */
     private final long maxSamplesPerApi;
+    /** 运行期按接口设置的保留上限覆盖项；未覆盖的接口走 {@link #maxSamplesPerApi} 默认值。 */
+    private final java.util.concurrent.ConcurrentHashMap<String, Long> maxSamplesOverrides =
+            new java.util.concurrent.ConcurrentHashMap<>();
     private final java.util.concurrent.ConcurrentHashMap<String, ApiWindow> apis =
             new java.util.concurrent.ConcurrentHashMap<>();
 
@@ -88,7 +96,7 @@ public class MetricsRegistry {
     /** 记录一次调用（显式指定事件时间戳，主要用于测试窗口滚动）。 */
     public void record(String api, CallStatus status, long latencyMillis, long timestampMillis) {
         validate(api, status, latencyMillis, timestampMillis);
-        ApiWindow window = apis.computeIfAbsent(api, ignored -> new ApiWindow());
+        ApiWindow window = apis.computeIfAbsent(api, ApiWindow::new);
         window.add(api, status, latencyMillis, timestampMillis);
     }
 
@@ -129,7 +137,7 @@ public class MetricsRegistry {
             try {
                 validate(event.api(), event.status(), event.latencyMillis(),
                         event.timestampMillis());
-                ApiWindow window = apis.computeIfAbsent(event.api(), ignored -> new ApiWindow());
+                ApiWindow window = apis.computeIfAbsent(event.api(), ApiWindow::new);
                 long bucketStart = window.addBackfill(event);
                 slots.computeIfAbsent(event.api(), ignored -> new TreeMap<>())
                         .merge(bucketStart, 1L, Long::sum);
@@ -193,7 +201,7 @@ public class MetricsRegistry {
         }
         ApiWindow window = apis.get(api);
         if (window == null) {
-            return new EvictionStats(api, maxSamplesPerApi, 0L, 0L, 0L);
+            return new EvictionStats(api, effectiveMaxSamples(api), 0L, 0L, 0L);
         }
         return window.evictionStats(api);
     }
@@ -208,6 +216,82 @@ public class MetricsRegistry {
 
     public long maxSamplesPerApi() {
         return maxSamplesPerApi;
+    }
+
+    /**
+     * 运行期为单个接口设置保留样本上限，立即生效、无需重启：
+     * 后续写入按新上限淘汰；若当前保留量已超过新上限，立即按"最旧样本优先"淘汰到位，
+     * 被淘汰的量计入该接口的容量淘汰统计。
+     *
+     * <p>上限必须为正数；{@code <= 0} 以 {@link #REASON_INVALID_MAX_SAMPLES} 明确拒绝，
+     * 不会改动已生效的上限、也不影响任何统计。恢复默认值请用
+     * {@link #clearMaxSamplesPerApi(String)}。
+     */
+    public void setMaxSamplesPerApi(String api, long maxSamples) {
+        if (api == null || api.isBlank()) {
+            throw new InvalidMetricException(REASON_BLANK_API, "api must not be blank");
+        }
+        if (maxSamples <= 0) {
+            throw new InvalidMetricException(REASON_INVALID_MAX_SAMPLES,
+                    "maxSamples must be positive, got " + maxSamples + " for api=" + api
+                            + " (use clearMaxSamplesPerApi to fall back to the default)");
+        }
+        ApiWindow window = apis.get(api);
+        if (window != null) {
+            // 覆盖项写入与按新上限淘汰在同一接口锁内完成，读者看不到"新上限+旧保留量"中间态
+            window.setLimitAndEnforce(maxSamples);
+            return;
+        }
+        maxSamplesOverrides.put(api, maxSamples);
+        // 窗口可能被并发创建且已按旧上限写入：补一次淘汰，保证保留量不越过新上限
+        ApiWindow concurrent = apis.get(api);
+        if (concurrent != null) {
+            concurrent.enforceCapacityNow();
+        }
+    }
+
+    /**
+     * 清除某接口的运行期上限覆盖，恢复为默认上限（构造参数，0 = 不限），立即生效。
+     *
+     * @return 此前是否存在覆盖项
+     */
+    public boolean clearMaxSamplesPerApi(String api) {
+        if (api == null || api.isBlank()) {
+            throw new InvalidMetricException(REASON_BLANK_API, "api must not be blank");
+        }
+        ApiWindow window = apis.get(api);
+        if (window != null) {
+            return window.clearLimitAndEnforce();
+        }
+        boolean removed = maxSamplesOverrides.remove(api) != null;
+        // 窗口可能被并发创建：默认上限可能小于当前保留量，补一次淘汰
+        ApiWindow concurrent = apis.get(api);
+        if (concurrent != null) {
+            concurrent.enforceCapacityNow();
+        }
+        return removed;
+    }
+
+    /** 查询某接口当前生效的保留上限：有运行期覆盖返回覆盖值，否则返回默认值（0 = 不限）。 */
+    public long maxSamplesPerApi(String api) {
+        if (api == null || api.isBlank()) {
+            throw new InvalidMetricException(REASON_BLANK_API, "api must not be blank");
+        }
+        return effectiveMaxSamples(api);
+    }
+
+    /** 某接口是否存在运行期上限覆盖项。 */
+    public boolean hasMaxSamplesOverride(String api) {
+        if (api == null || api.isBlank()) {
+            throw new InvalidMetricException(REASON_BLANK_API, "api must not be blank");
+        }
+        return maxSamplesOverrides.containsKey(api);
+    }
+
+    /** 生效上限：覆盖值优先，否则默认值。 */
+    private long effectiveMaxSamples(String api) {
+        Long override = maxSamplesOverrides.get(api);
+        return override != null ? override : maxSamplesPerApi;
     }
 
     private void validate(String api, CallStatus status, long latencyMillis, long timestampMillis) {
@@ -244,6 +328,8 @@ public class MetricsRegistry {
      * 单个接口的滚动窗口。所有字段仅在持有实例锁时访问。
      */
     private final class ApiWindow {
+        /** 所属接口名，用于查找该接口当前生效的保留上限。 */
+        private final String api;
         /** 桶起点 -> 桶，按时间升序；补报可插入任意位置。 */
         private final TreeMap<Long, Bucket> buckets = new TreeMap<>();
         /** 当前保留的样本总数（= 各桶事件数之和），窗口滚动与容量淘汰都会扣减。 */
@@ -251,6 +337,10 @@ public class MetricsRegistry {
         /** 因容量上限被淘汰的样本数 / 被整体清空的桶数（单调不减，自然滚动不计入）。 */
         private long evictedSamples;
         private long evictedBuckets;
+
+        private ApiWindow(String api) {
+            this.api = api;
+        }
 
         /** 实时写入：拒绝乱序回填（保持既有行为），返回所属桶起点。 */
         synchronized long add(String api, CallStatus status, long latency, long timestamp) {
@@ -348,20 +438,43 @@ public class MetricsRegistry {
         }
 
         synchronized EvictionStats evictionStats(String api) {
-            return new EvictionStats(api, maxSamplesPerApi, totalSamples,
+            return new EvictionStats(api, effectiveMaxSamples(api), totalSamples,
                     evictedSamples, evictedBuckets);
         }
 
+        /** 上限运行期调整后调用：在接口锁内按最新生效上限立即淘汰到位。 */
+        synchronized void enforceCapacityNow() {
+            enforceCapacity();
+        }
+
         /**
-         * 容量淘汰：保留样本数超过上限时，按"最旧样本优先"逐条弹出
+         * 运行期设置本接口上限：覆盖项写入与按新上限淘汰在同一临界区完成，
+         * 持锁读者（{@link #evictionStats}）不会看到"新上限 + 旧保留量"的中间态。
+         */
+        synchronized void setLimitAndEnforce(long maxSamples) {
+            maxSamplesOverrides.put(api, maxSamples);
+            enforceCapacity();
+        }
+
+        /** 清除本接口上限覆盖并立即按默认上限淘汰到位；返回此前是否存在覆盖项。 */
+        synchronized boolean clearLimitAndEnforce() {
+            boolean removed = maxSamplesOverrides.remove(api) != null;
+            enforceCapacity();
+            return removed;
+        }
+
+        /**
+         * 容量淘汰：保留样本数超过该接口当前生效上限时，按"最旧样本优先"逐条弹出
          * （时间最早的桶、桶内最早写入的事件），空桶整体移除。
-         * 只减真实存在的事件，计数恒为非负。
+         * 只减真实存在的事件，计数恒为非负。生效上限在淘汰时实时读取，
+         * 因此运行期调整对下一次写入/调整立即生效。
          */
         private void enforceCapacity() {
-            if (maxSamplesPerApi <= 0) {
+            long maxSamples = effectiveMaxSamples(api);
+            if (maxSamples <= 0) {
                 return;
             }
-            while (totalSamples > maxSamplesPerApi) {
+            while (totalSamples > maxSamples) {
                 Bucket oldest = buckets.firstEntry().getValue();
                 oldest.events.pollFirst();
                 totalSamples--;
