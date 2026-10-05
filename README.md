@@ -8,7 +8,7 @@
 ```
 core/    Clock（SystemClock / FixedClock）：时间抽象，测试可精确控制窗口滚动
 metrics/ CallStatus、MetricType、CallEvent、WindowSnapshot、MetricsRegistry、InvalidMetricException
-         BackfillReport（补报回执）、EvictionStats（容量淘汰统计）
+         BackfillReport（补报回执）、EvictionStats（容量淘汰统计）、CapacityInfo（生效上限视图）
 alert/   AlertState、ComparisonOperator、AlertRule、AlertEvaluation、AlertEvaluator、InvalidAlertRuleException
 web/      TelemetryConfiguration + TelemetryController（可选的薄 HTTP 入口）
 ```
@@ -96,18 +96,35 @@ web/      TelemetryConfiguration + TelemetryController（可选的薄 HTTP 入�
 
 ### 2.6 容量约束（每接口保留上限）
 
-`telemetry.max-samples-per-api`（默认 `0` = 不限，兼容既有行为）限制每个接口保留的
-样本数，防止长时间运行内存无限增长：
+`telemetry.max-samples-per-api`（默认 `0` = 不限，兼容既有行为）是**全局默认**保留上限；
+单个接口还可以在**运行期**单独设置/调整/清除自己的上限，无需重启：
 
+- **按接口设置（运行期生效）**：`MetricsRegistry.setMaxSamples(api, maxSamples)`
+  （或 `PUT /telemetry/metrics/{api}/capacity`，body `{"maxSamples": N}`）。
+  `N` 必须为正数；`0`/负数/缺字段以原因码 `INVALID_CAPACITY`（HTTP 400）**明确拒绝**，
+  生效上限与淘汰统计保持原样，不会被悄悄改掉。
+  设置后对后续写入**立刻生效**；若当前保留量已超过新上限，立即按最旧优先淘汰到位，
+  被淘汰的量计入该接口的容量淘汰统计。
+- **按接口查询**：`MetricsRegistry.capacityInfo(api)`
+  （或 `GET /telemetry/metrics/{api}/capacity`）返回 `CapacityInfo`
+  （当前生效上限、全局默认值、是否单独设置 `overridden`）。
+  未单独设置的接口走全局默认值；`EvictionStats.maxSamplesPerApi` 展示的也是
+  **该接口自己生效的上限**，不会所有接口报成同一个值。
+- **恢复默认**：`MetricsRegistry.clearMaxSamples(api)`
+  （或 `DELETE /telemetry/metrics/{api}/capacity`）清除单独设置，重新走全局默认值。
 - **淘汰规则固定可预期**：超限后按“最旧样本优先”逐条淘汰（时间最早的桶、桶内最早
   写入的事件），空桶整体移除。只减真实存在的事件，计数恒为非负。
 - **淘汰量单独暴露**：`MetricsRegistry.evictionStats(api)`（或
   `GET /telemetry/metrics/{api}/evictions`）返回 `EvictionStats`
-  （上限值、当前保留量、累计容量淘汰样本数/桶数）。窗口随时间自然滚动的淘汰**不计入**；
-  任意时刻满足 `写入总数 = 保留量 + 容量淘汰量 + 自然滚动淘汰量`。
+  （该接口生效的上限值、当前保留量、累计容量淘汰样本数/桶数）。窗口随时间自然滚动的
+  淘汰**不计入**；任意时刻满足 `写入总数 = 保留量 + 容量淘汰量 + 自然滚动淘汰量`。
 - **与补报并存**：补报回执的 `accepted` 按接受口径统计，与容量淘汰分开；补报触发
   超限同样按最旧优先淘汰，上述守恒口径依然成立
   （见 `CapacityEvictionTest.backfillAndCapacityEvictionTogetherKeepAccountingConsistent`）。
+- **并发口径**：上限调整、容量淘汰与批量乱序补报并发发生时，淘汰与写入/补报在
+  接口级锁内串行，任何时刻读到的统计不为负、不错乱，
+  `接受总数 = 保留量 + 容量淘汰量` 的账始终对得上
+  （见 `PerApiCapacityTest.capacityEvictionConcurrentWithBackfillAndAdjustmentKeepsAccounting`）。
 
 ## 3. 告警状态迁移规则
 
@@ -186,8 +203,19 @@ curl -s -XPOST localhost:8080/telemetry/events/backfill -H 'Content-Type: applic
 # 按时间点回看（t 时刻所在窗口的聚合，不受之后写入影响）
 curl -s 'localhost:8080/telemetry/metrics/order/at?timestampMillis=1791036400000'
 
-# 容量淘汰统计（需先设 telemetry.max-samples-per-api）
+# 容量淘汰统计（需先设 telemetry.max-samples-per-api 或单接口上限）
 curl -s localhost:8080/telemetry/metrics/order/evictions
+
+# 运行期设置单接口保留上限（立即生效，无需重启；必须为正数）
+curl -s -XPUT localhost:8080/telemetry/metrics/order/capacity \
+  -H 'Content-Type: application/json' -d '{"maxSamples":1000}'
+# -> {"api":"order","maxSamplesPerApi":1000,"defaultMaxSamplesPerApi":0,"overridden":true}
+
+# 查询该接口当前生效的上限（未单独设置的接口返回默认值 + overridden=false）
+curl -s localhost:8080/telemetry/metrics/order/capacity
+
+# 清除单独设置，恢复走全局默认值
+curl -s -XDELETE localhost:8080/telemetry/metrics/order/capacity
 ```
 
 非法埋点/规则返回 HTTP 400（未知规则 404），响应体形如
@@ -200,8 +228,11 @@ curl -s localhost:8080/telemetry/metrics/order/evictions
   `snapshot(api)`、全部原因码与拒绝语义**保持不变**，既有调用方无需修改；
   实时通道仍拒绝乱序回填（乱序历史数据请走 `backfill`）。
 - 默认 `telemetry.max-samples-per-api=0`（不限容量），行为与上一版完全一致；
-  只有显式设置上限后才启用容量淘汰。
-- 新增能力均为纯增量 API：`backfill` / `snapshotAt` / `evictionStats` 及对应 HTTP 端点。
+  只有显式设置上限后才启用容量淘汰。单接口上限为纯增量的运行期 API
+  （`setMaxSamples` / `clearMaxSamples` / `capacityInfo` 及对应 HTTP 端点），
+  不设置时所有接口仍走全局默认值，既有调用方无需修改。
+- 新增能力均为纯增量 API：`backfill` / `snapshotAt` / `evictionStats` /
+  按接口容量设置与查询，及对应 HTTP 端点。
 
 ## 6. 验证方法
 
@@ -209,7 +240,7 @@ curl -s localhost:8080/telemetry/metrics/order/evictions
 mvn test
 ```
 
-测试共 25 个（全部为进程内测试，无外部依赖），日志中会打印**输入、聚合结果与判定依据**：
+测试共 30 个（全部为进程内测试，无外部依赖），日志中会打印**输入、聚合结果与判定依据**：
 
 | 测试类 | 覆盖场景 |
 | --- | --- |
@@ -217,9 +248,11 @@ mvn test
 | `BackfillTest` | 乱序补报与实时写入殊途同归（聚合逐字段一致）；回执的落点明细与拒绝原因码；补报与实时并发写入不丢失不重复 |
 | `SnapshotAtTest` | 回看只反映该时刻及所在窗口数据；之后写入不影响、反复查询稳定；与当时实时快照一致；未来时刻拒绝、滚出保留期返回空 |
 | `CapacityEvictionTest` | 到顶后最旧样本优先淘汰、淘汰量单独暴露；并发读写下无负值、统计自洽、总量守恒；补报+容量淘汰并存口径；默认不限容量兼容 |
+| `PerApiCapacityTest` | 不同接口不同上限、淘汰量按接口分别统计；运行期调低/调高/清除上限对后续写入立刻生效；0/负数上限明确拒绝且状态不变；上限调整+容量淘汰+批量乱序补报并发时无负值、总量守恒 |
 | `AlertEvaluatorTest` | 四态完整迁移；待确认期抖动取消；触发后恢复抖动不解警；恢复需连续达标；恢复后再超标重回 PENDING；同刻重复评估幂等；非法规则、未知指标、未知规则、时间回退拒绝 |
 | `ConcurrencyTest` | 16 线程 × 5000 次写入，总数与真实请求严格一致、无丢失重复；8 线程 × 2000 次同刻评估只推进一次状态 |
 | `TelemetryControllerIntegrationTest` | Spring Boot 端到端：埋点→聚合→注册→评估，以及 HTTP 层非法输入的原因码 |
 | `TelemetryBackfillIntegrationTest` | 新端点端到端：补报回执（含 NULL_TIMESTAMP/NULL_STATUS 容错）、回看稳定性、容量上限装配与淘汰统计 |
+| `CapacityConfigIntegrationTest` | 按接口上限端到端：运行期设置/查询/清除、未设置走默认值、无效上限 400 + INVALID_CAPACITY 且生效值不变 |
 
 核心逻辑直接使用可推进时钟复现窗口滚动与“抖动→触发→恢复”全过程，结果与执行机器速度无关、可复现。

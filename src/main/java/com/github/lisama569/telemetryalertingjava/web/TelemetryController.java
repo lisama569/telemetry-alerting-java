@@ -8,6 +8,7 @@ import com.github.lisama569.telemetryalertingjava.alert.InvalidAlertRuleExceptio
 import com.github.lisama569.telemetryalertingjava.metrics.BackfillReport;
 import com.github.lisama569.telemetryalertingjava.metrics.CallEvent;
 import com.github.lisama569.telemetryalertingjava.metrics.CallStatus;
+import com.github.lisama569.telemetryalertingjava.metrics.CapacityInfo;
 import com.github.lisama569.telemetryalertingjava.metrics.EvictionStats;
 import com.github.lisama569.telemetryalertingjava.metrics.InvalidMetricException;
 import com.github.lisama569.telemetryalertingjava.metrics.MetricType;
@@ -15,10 +16,12 @@ import com.github.lisama569.telemetryalertingjava.metrics.MetricsRegistry;
 import com.github.lisama569.telemetryalertingjava.metrics.WindowSnapshot;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -129,6 +132,33 @@ public class TelemetryController {
     @GetMapping("/metrics/{api}/evictions")
     public EvictionStats evictions(@PathVariable String api) {
         return registry.evictionStats(api);
+    }
+
+    /** 查询接口当前生效的保留上限（未单独设置时返回默认值）。 */
+    @GetMapping("/metrics/{api}/capacity")
+    public CapacityInfo capacity(@PathVariable String api) {
+        return registry.capacityInfo(api);
+    }
+
+    /**
+     * 运行期设置单接口保留上限（立即生效，无需重启）。
+     * maxSamples 必须为正数；缺失/0/负数返回 400 + INVALID_CAPACITY，上限保持不变。
+     */
+    @PutMapping("/metrics/{api}/capacity")
+    public CapacityInfo setCapacity(@PathVariable String api,
+                                    @RequestBody CapacityRequest request) {
+        Long maxSamples = request == null ? null : request.maxSamples();
+        if (maxSamples == null) {
+            throw new InvalidMetricException(MetricsRegistry.REASON_INVALID_CAPACITY,
+                    "maxSamples is required and must be positive");
+        }
+        return registry.setMaxSamples(api, maxSamples);
+    }
+
+    /** 清除单接口的单独上限，恢复走全局默认值。 */
+    @DeleteMapping("/metrics/{api}/capacity")
+    public CapacityInfo clearCapacity(@PathVariable String api) {
+        return registry.clearMaxSamples(api);
     }
 
     /** 注册告警规则。 */
